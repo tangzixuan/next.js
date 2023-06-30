@@ -47,7 +47,6 @@ import getRouteFromEntrypoint from '../get-route-from-entrypoint'
 import { fileExists } from '../../lib/file-exists'
 import {
   difference,
-  isInstrumentationHookFile,
   isMiddlewareFile,
   isMiddlewareFilename,
 } from '../../build/utils'
@@ -62,7 +61,7 @@ import { RouteMatch } from '../future/route-matches/route-match'
 import { parseVersionInfo, VersionInfo } from './parse-version-info'
 import { isAPIRoute } from '../../lib/is-api-route'
 import { getRouteLoaderEntry } from '../../build/webpack/loaders/next-route-loader'
-import { isInternalPathname } from '../../lib/is-internal-pathname'
+import { isInternalComponent } from '../../lib/is-internal-component'
 
 function diff(a: Set<any>, b: Set<any>) {
   return new Set([...a].filter((v) => !b.has(v)))
@@ -185,6 +184,7 @@ export default class HotReloader {
   public edgeServerStats: webpack.Stats | null
   private clientError: Error | null = null
   private serverError: Error | null = null
+  private hmrServerError: Error | null = null
   private serverPrevDocumentHash: string | null
   private serverChunkNames?: Set<string>
   private prevChunkNames?: Set<any>
@@ -327,10 +327,21 @@ export default class HotReloader {
     return { finished }
   }
 
+  public setHmrServerError(error: Error | null): void {
+    this.hmrServerError = error
+  }
+
+  public clearHmrServerError(): void {
+    if (this.hmrServerError) {
+      this.setHmrServerError(null)
+      this.send('reloadPage')
+    }
+  }
+
   public onHMR(req: IncomingMessage, _socket: Duplex, head: Buffer) {
     wsServer.handleUpgrade(req, req.socket, head, (client) => {
       this.webpackHotMiddleware?.onHMR(client)
-      this.onDemandEntries?.onHMR(client)
+      this.onDemandEntries?.onHMR(client, () => this.hmrServerError)
 
       client.addEventListener('message', ({ data }) => {
         data = typeof data !== 'string' ? data.toString() : data
@@ -887,16 +898,14 @@ export default class HotReloader {
                 } else if (
                   !isAPIRoute(page) &&
                   !isMiddlewareFile(page) &&
-                  !isInternalPathname(relativeRequest) &&
-                  !isInstrumentationHookFile(page)
+                  !isInternalComponent(relativeRequest)
                 ) {
                   value = getRouteLoaderEntry({
                     page,
+                    pages: this.pagesMapping,
                     absolutePagePath: relativeRequest,
                     preferredRegion: staticInfo.preferredRegion,
-                    middlewareConfig: Buffer.from(
-                      JSON.stringify(staticInfo.middleware || {})
-                    ).toString('base64'),
+                    middlewareConfig: staticInfo.middleware ?? {},
                   })
                 } else {
                   value = relativeRequest
@@ -940,6 +949,26 @@ export default class HotReloader {
       this.activeConfigs
     ) as unknown as webpack.MultiCompiler
 
+    // Copy over the filesystem so that it is shared between all compilers.
+    const inputFileSystem = this.multiCompiler.compilers[0].inputFileSystem
+    for (const compiler of this.multiCompiler.compilers) {
+      compiler.inputFileSystem = inputFileSystem
+      // This is set for the initial compile. After that Watching class in webpack adds it.
+      compiler.fsStartTime = Date.now()
+      // Ensure NodeEnvironmentPlugin doesn't purge the inputFileSystem. Purging is handled in `done` below.
+      compiler.hooks.beforeRun.intercept({
+        register(tapInfo: any) {
+          if (tapInfo.name === 'NodeEnvironmentPlugin') {
+            return null
+          }
+          return tapInfo
+        },
+      })
+    }
+
+    this.multiCompiler.hooks.done.tap('NextjsHotReloader', () => {
+      inputFileSystem.purge!()
+    })
     watchCompilers(
       this.multiCompiler.compilers[0],
       this.multiCompiler.compilers[1],

@@ -21,7 +21,6 @@ import { AppPathnameNormalizer } from '../../../server/future/normalizers/built/
 import { RouteKind } from '../../../server/future/route-kind'
 import { AppRouteRouteModuleOptions } from '../../../server/future/route-modules/app-route/module'
 import { AppBundlePathNormalizer } from '../../../server/future/normalizers/built/app/app-bundle-path-normalizer'
-import { FileType, fileExists } from '../../../lib/file-exists'
 import { MiddlewareConfig } from '../../analysis/get-page-static-info'
 
 export type AppLoaderOptions = {
@@ -59,7 +58,8 @@ type PathResolver = (
   pathname: string
 ) => Promise<string | undefined> | string | undefined
 export type MetadataResolver = (
-  pathname: string,
+  dir: string,
+  filename: string,
   extensions: readonly string[]
 ) => Promise<string | undefined>
 
@@ -511,8 +511,37 @@ const nextAppLoader: AppLoader = async function nextAppLoader() {
     return createAbsolutePath(appDir, pathToResolve)
   }
 
+  // Cached checker to see if a file exists in a given directory.
+  // This can be more efficient than checking them with `fs.stat` one by one
+  // because all the thousands of files are likely in a few possible directories.
+  // Note that it should only be cached for this compilation, not globally.
+  const filesInDir = new Map<string, Set<string>>()
+  const fileExistsInDirectory = async (dirname: string, fileName: string) => {
+    const existingFiles = filesInDir.get(dirname)
+    if (existingFiles) {
+      return existingFiles.has(fileName)
+    }
+    try {
+      const files = await fs.readdir(dirname, { withFileTypes: true })
+      const fileNames = new Set<string>()
+      for (const file of files) {
+        if (file.isFile()) {
+          fileNames.add(file.name)
+        }
+      }
+      filesInDir.set(dirname, fileNames)
+      return fileNames.has(fileName)
+    } catch (err) {
+      return false
+    }
+  }
+
   const resolver: PathResolver = async (pathname) => {
     const absolutePath = createAbsolutePath(appDir, pathname)
+
+    const filenameIndex = absolutePath.lastIndexOf(path.sep)
+    const dirname = absolutePath.slice(0, filenameIndex)
+    const filename = absolutePath.slice(filenameIndex + 1)
 
     let result: string | undefined
 
@@ -520,34 +549,37 @@ const nextAppLoader: AppLoader = async function nextAppLoader() {
       const absolutePathWithExtension = `${absolutePath}${ext}`
       if (
         !result &&
-        (await fileExists(absolutePathWithExtension, FileType.File))
+        (await fileExistsInDirectory(dirname, `${filename}${ext}`))
       ) {
-        // Ensures we call `addMissingDependency` for all files that didn't match
         result = absolutePathWithExtension
-      } else {
-        this.addMissingDependency(absolutePathWithExtension)
       }
+      // Call `addMissingDependency` for all files even if they didn't match,
+      // because they might be added or removed during development.
+      this.addMissingDependency(absolutePathWithExtension)
     }
 
     return result
   }
 
-  const metadataResolver: MetadataResolver = async (pathname, exts) => {
-    const absolutePath = createAbsolutePath(appDir, pathname)
+  const metadataResolver: MetadataResolver = async (
+    dirname,
+    filename,
+    exts
+  ) => {
+    const absoluteDir = createAbsolutePath(appDir, dirname)
 
     let result: string | undefined
 
     for (const ext of exts) {
       // Compared to `resolver` above the exts do not have the `.` included already, so it's added here.
-      const absolutePathWithExtension = `${absolutePath}.${ext}`
-      if (
-        !result &&
-        (await fileExists(absolutePathWithExtension, FileType.File))
-      ) {
+      const filenameWithExt = `${filename}.${ext}`
+      const absolutePathWithExtension = `${absoluteDir}${path.sep}${filenameWithExt}`
+      if (!result && (await fileExistsInDirectory(dirname, filenameWithExt))) {
         result = absolutePathWithExtension
-      } else {
-        this.addMissingDependency(absolutePathWithExtension)
       }
+      // Call `addMissingDependency` for all files even if they didn't match,
+      // because they might be added or removed during development.
+      this.addMissingDependency(absolutePathWithExtension)
     }
 
     return result
@@ -610,7 +642,8 @@ const nextAppLoader: AppLoader = async function nextAppLoader() {
         throw new Error(message)
       }
 
-      // Get the new result with the created root layout.
+      // Clear fs cache, get the new result with the created root layout.
+      filesInDir.clear()
       treeCodeResult = await createTreeCodeFromPath(pagePath, {
         resolveDir,
         resolver,
@@ -623,33 +656,22 @@ const nextAppLoader: AppLoader = async function nextAppLoader() {
     }
   }
 
+  // Prefer to modify next/src/server/app-render/entry-base.ts since this is shared with Turbopack.
+  // Any changes to this code should be reflected in Turbopack's app_source.rs and/or app-renderer.tsx as well.
   const result = `
     export ${treeCodeResult.treeCode}
     export ${treeCodeResult.pages}
-
-    export { default as AppRouter } from 'next/dist/client/components/app-router'
-    export { default as LayoutRouter } from 'next/dist/client/components/layout-router'
-    export { default as RenderFromTemplateContext } from 'next/dist/client/components/render-from-template-context'
     export { default as GlobalError } from ${JSON.stringify(
       treeCodeResult.globalError || 'next/dist/client/components/error-boundary'
     )}
+    export const originalPathname = ${JSON.stringify(page)}
+    export const __next_app__ = {
+      require: __webpack_require__,
+      // all modules are in the entry chunk, so we never actually need to load chunks in webpack
+      loadChunk: () => Promise.resolve()
+    }
 
-    export { staticGenerationAsyncStorage } from 'next/dist/client/components/static-generation-async-storage'
-
-    export { requestAsyncStorage } from 'next/dist/client/components/request-async-storage'
-    export { actionAsyncStorage } from 'next/dist/client/components/action-async-storage'
-
-    export { staticGenerationBailout } from 'next/dist/client/components/static-generation-bailout'
-    export { default as StaticGenerationSearchParamsBailoutProvider } from 'next/dist/client/components/static-generation-searchparams-bailout-provider'
-    export { createSearchParamsBailoutProxy } from 'next/dist/client/components/searchparams-bailout-proxy'
-
-    export * as serverHooks from 'next/dist/client/components/hooks-server-context'
-
-    export { renderToReadableStream, decodeReply, decodeAction } from 'react-server-dom-webpack/server.edge'
-    export const __next_app_webpack_require__ = __webpack_require__
-    export { preloadStyle, preloadFont, preconnect } from 'next/dist/server/app-render/rsc/preloads'
-
-    export const originalPathname = "${page}"
+    export * from 'next/dist/server/app-render/entry-base'
   `
 
   return result
