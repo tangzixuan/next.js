@@ -116,6 +116,7 @@ import {
   parsedUrlQueryToParams,
   type RouteMatch,
 } from './future/route-matches/route-match'
+import { signalFromNodeResponse } from './web/spec-extension/adapters/next-request'
 
 export type FindComponentsResult = {
   components: LoadComponentsReturnType
@@ -1715,7 +1716,12 @@ export default abstract class Server<ServerOptions extends Options = Options> {
 
         try {
           // Handle the match and collect the response if it's a static response.
-          const response = await this.handlers.handle(match, req, context)
+          const response = await this.handlers.handle(
+            match,
+            req,
+            context,
+            signalFromNodeResponse((res as NodeNextResponse).originalResponse)
+          )
 
           ;(req as any).fetchMetrics = (
             context.staticGenerationContext as any
