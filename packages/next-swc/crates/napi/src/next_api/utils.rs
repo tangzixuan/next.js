@@ -9,7 +9,11 @@ use napi::{
 use serde::Serialize;
 use turbo_tasks::{unit, TaskId, TurboTasks};
 use turbopack_binding::{
-    turbo::tasks_memory::MemoryBackend, turbopack::core::error::PrettyPrintError,
+    turbo::tasks_memory::MemoryBackend,
+    turbopack::core::{
+        diagnostics::{Diagnostic, PlainDiagnostic},
+        error::PrettyPrintError,
+    },
 };
 
 /// A helper type to hold both a Vc operation and the TurboTasks root process.
@@ -75,7 +79,19 @@ pub fn root_task_dispose(
 pub struct NapiIssue {}
 
 #[napi(object)]
-pub struct NapiDiagnostic {}
+pub struct NapiDiagnostic {
+    pub key: String,
+    pub value: String,
+}
+
+impl NapiDiagnostic {
+    pub fn from(diagnostic: &PlainDiagnostic) -> Self {
+        Self {
+            key: diagnostic.key.clone(),
+            value: diagnostic.value.clone()
+        }
+    }
+}
 
 pub struct TurbopackResult<T: ToNapiValue> {
     pub result: T,
