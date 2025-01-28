@@ -1,7 +1,7 @@
 import createStore from 'next/dist/compiled/unistore'
 import stripAnsi from 'next/dist/compiled/strip-ansi'
 import { type Span, flushAllTraces, trace } from '../../trace'
-import { teardownHeapProfiler, teardownTraceSubscriber } from '../swc'
+import { teardownTraceSubscriber } from '../swc'
 import * as Log from './log'
 
 const MAX_LOG_SKIP_DURATION = 500 // 500ms
@@ -80,9 +80,16 @@ let trigger = '' // default, use empty string for trigger
 let triggerUrl: string | undefined = undefined
 let loadingLogTimer: NodeJS.Timeout | null = null
 let traceSpan: Span | null = null
+let logging = true
 
 store.subscribe((state) => {
-  if (state.logging === false) {
+  // Update persisted logging state
+  if ('logging' in state) {
+    logging = state.logging
+  }
+
+  // If logging is disabled, do not log
+  if (!logging) {
     return
   }
 
@@ -145,7 +152,6 @@ store.subscribe((state) => {
     // Ensure traces are flushed after each compile in development mode
     flushAllTraces()
     teardownTraceSubscriber()
-    teardownHeapProfiler()
     return
   }
 
@@ -169,7 +175,6 @@ store.subscribe((state) => {
     // Ensure traces are flushed after each compile in development mode
     flushAllTraces()
     teardownTraceSubscriber()
-    teardownHeapProfiler()
     return
   }
 
@@ -200,5 +205,4 @@ store.subscribe((state) => {
   // Ensure traces are flushed after each compile in development mode
   flushAllTraces()
   teardownTraceSubscriber()
-  teardownHeapProfiler()
 })
