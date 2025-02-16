@@ -29,8 +29,6 @@ const unsupportedTurbopackNextConfigOptions = [
   // 'experimental.serverMinification',
   // 'experimental.serverSourceMaps',
 
-  'experimental.adjustFontFallbacks',
-  'experimental.adjustFontFallbacksWithSizeAdjust',
   'experimental.allowedRevalidateHeaderKeys',
   'experimental.extensionAlias',
   'experimental.fallbackNodePolyfills',
@@ -47,13 +45,13 @@ const unsupportedTurbopackNextConfigOptions = [
   'experimental.forceSwcTransforms',
   'experimental.fullySpecified',
   'experimental.urlImports',
+  'experimental.slowModuleDetection',
 ]
 
-// The following will need to be supported by `next build --turbo`
-const unsupportedProductionSpecificTurbopackNextConfigOptions = [
+// The following will need to be supported by `next build --turbopack`
+const unsupportedProductionSpecificTurbopackNextConfigOptions: string[] = [
   // TODO: Support disabling sourcemaps, currently they're always enabled.
   // 'productionBrowserSourceMaps',
-  'reactProductionProfiling',
 ]
 
 // check for babelrc, swc plugins
@@ -174,7 +172,7 @@ export async function validateTurboNextConfig({
   }
 
   const feedbackMessage = `Learn more about Next.js and Turbopack: ${underline(
-    'https://nextjs.link/with-turbopack'
+    'https://nextjs.org/docs/architecture/turbopack'
   )}\n`
 
   if (hasWebpackConfig && !hasTurboConfig) {

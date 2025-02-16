@@ -1,22 +1,31 @@
 import type { ReactNode } from 'react'
-import { useCallback, useEffect, startTransition, useMemo, useRef } from 'react'
+import {
+  useCallback,
+  useEffect,
+  startTransition,
+  useMemo,
+  useRef,
+  useSyncExternalStore,
+} from 'react'
 import stripAnsi from 'next/dist/compiled/strip-ansi'
 import formatWebpackMessages from '../internal/helpers/format-webpack-messages'
-import { usePathname, useRouter } from '../../navigation'
+import { useRouter } from '../../navigation'
 import {
   ACTION_BEFORE_REFRESH,
   ACTION_BUILD_ERROR,
   ACTION_BUILD_OK,
+  ACTION_DEBUG_INFO,
   ACTION_REFRESH,
+  ACTION_STATIC_INDICATOR,
   ACTION_UNHANDLED_ERROR,
   ACTION_UNHANDLED_REJECTION,
   ACTION_VERSION_INFO,
   useErrorOverlayReducer,
 } from '../shared'
-import { parseStack } from '../internal/helpers/parseStack'
-import ReactDevOverlay from './ReactDevOverlay'
-import { useErrorHandler } from '../internal/helpers/use-error-handler'
-import { RuntimeErrorHandler } from '../internal/helpers/runtime-error-handler'
+import { parseStack } from '../internal/helpers/parse-stack'
+import ReactDevOverlay from './react-dev-overlay'
+import { useErrorHandler } from '../../errors/use-error-handler'
+import { RuntimeErrorHandler } from '../../errors/runtime-error-handler'
 import {
   useSendMessage,
   useTurbopack,
@@ -32,32 +41,60 @@ import type {
 } from '../../../../server/dev/hot-reloader-types'
 import { extractModulesFromTurbopackMessage } from '../../../../server/dev/extract-modules-from-turbopack-message'
 import { REACT_REFRESH_FULL_RELOAD_FROM_ERROR } from '../shared'
-import type { HydrationErrorState } from '../internal/helpers/hydration-error-info'
-import type { ShowHideHandler } from '../../../dev/dev-build-watcher'
-interface Dispatcher {
+import type { HydrationErrorState } from '../../errors/hydration-error-info'
+import type { DebugInfo } from '../types'
+import { useUntrackedPathname } from '../../navigation-untracked'
+import { getReactStitchedError } from '../../errors/stitched-error'
+import { shouldRenderRootLevelErrorOverlay } from '../../../lib/is-error-thrown-while-rendering-rsc'
+import { handleDevBuildIndicatorHmrEvents } from '../../../dev/dev-build-indicator/internal/handle-dev-build-indicator-hmr-events'
+import type { GlobalErrorComponent } from '../../error-boundary'
+
+export interface Dispatcher {
   onBuildOk(): void
   onBuildError(message: string): void
   onVersionInfo(versionInfo: VersionInfo): void
+  onDebugInfo(debugInfo: DebugInfo): void
   onBeforeRefresh(): void
   onRefresh(): void
+  onStaticIndicator(status: boolean): void
 }
 
 let mostRecentCompilationHash: any = null
 let __nextDevClientId = Math.round(Math.random() * 100 + Date.now())
 let reloading = false
 let startLatency: number | null = null
+let turbopackLastUpdateLatency: number | null = null
+let turbopackUpdatedModules: Set<string> = new Set()
 
-function onBeforeFastRefresh(dispatcher: Dispatcher, hasUpdates: boolean) {
+let pendingHotUpdateWebpack = Promise.resolve()
+let resolvePendingHotUpdateWebpack: () => void = () => {}
+function setPendingHotUpdateWebpack() {
+  pendingHotUpdateWebpack = new Promise((resolve) => {
+    resolvePendingHotUpdateWebpack = () => {
+      resolve()
+    }
+  })
+}
+
+export function waitForWebpackRuntimeHotUpdate() {
+  return pendingHotUpdateWebpack
+}
+
+function handleBeforeHotUpdateWebpack(
+  dispatcher: Dispatcher,
+  hasUpdates: boolean
+) {
   if (hasUpdates) {
     dispatcher.onBeforeRefresh()
   }
 }
 
-function onFastRefresh(
+function handleSuccessfulHotUpdateWebpack(
   dispatcher: Dispatcher,
   sendMessage: (message: string) => void,
   updatedModules: ReadonlyArray<string>
 ) {
+  resolvePendingHotUpdateWebpack()
   dispatcher.onBuildOk()
   reportHmrLatency(sendMessage, updatedModules)
 
@@ -69,7 +106,9 @@ function reportHmrLatency(
   updatedModules: ReadonlyArray<string>
 ) {
   if (!startLatency) return
-  let endLatency = Date.now()
+  // turbopack has a debounce for the "built" event which we don't want to
+  // incorrectly show in this number, use the last TURBOPACK_MESSAGE time
+  let endLatency = turbopackLastUpdateLatency ?? Date.now()
   const latency = endLatency - startLatency
   console.log(`[Fast Refresh] done in ${latency}ms`)
   sendMessage(
@@ -159,6 +198,7 @@ function tryApplyUpdates(
   dispatcher: Dispatcher
 ) {
   if (!isUpdateAvailable() || !canApplyUpdates()) {
+    resolvePendingHotUpdateWebpack()
     dispatcher.onBuildOk()
     reportHmrLatency(sendMessage, [])
     return
@@ -278,15 +318,20 @@ function processMessage(
   function handleHotUpdate() {
     if (process.env.TURBOPACK) {
       dispatcher.onBuildOk()
+      reportHmrLatency(sendMessage, [...turbopackUpdatedModules])
     } else {
       tryApplyUpdates(
         function onBeforeHotUpdate(hasUpdates: boolean) {
-          onBeforeFastRefresh(dispatcher, hasUpdates)
+          handleBeforeHotUpdateWebpack(dispatcher, hasUpdates)
         },
         function onSuccessfulHotUpdate(webpackUpdatedModules: string[]) {
           // Only dismiss it when we're sure it's a hot update.
           // Otherwise it would flicker right before the reload.
-          onFastRefresh(dispatcher, sendMessage, webpackUpdatedModules)
+          handleSuccessfulHotUpdateWebpack(
+            dispatcher,
+            sendMessage,
+            webpackUpdatedModules
+          )
         },
         sendMessage,
         dispatcher
@@ -296,23 +341,38 @@ function processMessage(
 
   switch (obj.action) {
     case HMR_ACTIONS_SENT_TO_BROWSER.APP_ISR_MANIFEST: {
-      if (process.env.__NEXT_APP_ISR_INDICATOR) {
+      if (
+        process.env.__NEXT_APP_ISR_INDICATOR ||
+        process.env.__NEXT_EXPERIMENTAL_NEW_DEV_OVERLAY
+      ) {
         if (appIsrManifestRef) {
           appIsrManifestRef.current = obj.data
-
-          const isrIndicatorHandlers: ShowHideHandler | undefined =
-            window.next?.isrIndicatorHandlers
 
           // handle initial status on receiving manifest
           // navigation is handled in useEffect for pathname changes
           // as we'll receive the updated manifest before usePathname
           // triggers for new value
-          if (isrIndicatorHandlers) {
-            if ((pathnameRef.current as string) in obj.data) {
-              isrIndicatorHandlers.show()
-            } else {
-              isrIndicatorHandlers.hide()
+          if ((pathnameRef.current as string) in obj.data) {
+            if (process.env.__NEXT_APP_ISR_INDICATOR) {
+              // the indicator can be hidden for an hour.
+              // check if it's still hidden
+              const indicatorHiddenAt = Number(
+                localStorage?.getItem('__NEXT_DISMISS_PRERENDER_INDICATOR')
+              )
+
+              const isHidden =
+                indicatorHiddenAt &&
+                !isNaN(indicatorHiddenAt) &&
+                Date.now() < indicatorHiddenAt
+
+              if (!isHidden) {
+                dispatcher.onStaticIndicator(true)
+              }
+            } else if (process.env.__NEXT_EXPERIMENTAL_NEW_DEV_OVERLAY) {
+              dispatcher.onStaticIndicator(true)
             }
+          } else {
+            dispatcher.onStaticIndicator(false)
           }
         }
       }
@@ -320,6 +380,11 @@ function processMessage(
     }
     case HMR_ACTIONS_SENT_TO_BROWSER.BUILDING: {
       startLatency = Date.now()
+      turbopackLastUpdateLatency = null
+      turbopackUpdatedModules.clear()
+      if (!process.env.TURBOPACK) {
+        setPendingHotUpdateWebpack()
+      }
       console.log('[Fast Refresh] rebuilding')
       break
     }
@@ -333,6 +398,7 @@ function processMessage(
 
       // Is undefined when it's a 'built' event
       if ('versionInfo' in obj) dispatcher.onVersionInfo(obj.versionInfo)
+      if ('debug' in obj && obj.debug) dispatcher.onDebugInfo(obj.debug)
 
       const hasErrors = Boolean(errors && errors.length)
       // Compilation with errors (e.g. syntax error or missing modules).
@@ -395,11 +461,13 @@ function processMessage(
     case HMR_ACTIONS_SENT_TO_BROWSER.TURBOPACK_CONNECTED: {
       processTurbopackMessage({
         type: HMR_ACTIONS_SENT_TO_BROWSER.TURBOPACK_CONNECTED,
+        data: {
+          sessionId: obj.data.sessionId,
+        },
       })
       break
     }
     case HMR_ACTIONS_SENT_TO_BROWSER.TURBOPACK_MESSAGE: {
-      const updatedModules = extractModulesFromTurbopackMessage(obj.data)
       dispatcher.onBeforeRefresh()
       processTurbopackMessage({
         type: HMR_ACTIONS_SENT_TO_BROWSER.TURBOPACK_MESSAGE,
@@ -410,7 +478,10 @@ function processMessage(
         console.warn(REACT_REFRESH_FULL_RELOAD_FROM_ERROR)
         performFullReload(null, sendMessage)
       }
-      reportHmrLatency(sendMessage, updatedModules)
+      for (const module of extractModulesFromTurbopackMessage(obj.data)) {
+        turbopackUpdatedModules.add(module)
+      }
+      turbopackLastUpdateLatency = Date.now()
       break
     }
     // TODO-APP: make server component change more granular
@@ -419,13 +490,20 @@ function processMessage(
         JSON.stringify({
           event: 'server-component-reload-page',
           clientId: __nextDevClientId,
+          hash: obj.hash,
         })
       )
+
+      // Store the latest hash in a session cookie so that it's sent back to the
+      // server with any subsequent requests.
+      document.cookie = `__next_hmr_refresh_hash__=${obj.hash}`
+
       if (RuntimeErrorHandler.hadRuntimeError) {
         if (reloading) return
         reloading = true
         return window.location.reload()
       }
+
       startTransition(() => {
         router.hmrRefresh()
         dispatcher.onRefresh()
@@ -477,9 +555,11 @@ function processMessage(
 export default function HotReload({
   assetPrefix,
   children,
+  globalError,
 }: {
   assetPrefix: string
-  children?: ReactNode
+  children: ReactNode
+  globalError: [GlobalErrorComponent, React.ReactNode]
 }) {
   const [state, dispatch] = useErrorOverlayReducer()
 
@@ -500,22 +580,39 @@ export default function HotReload({
       onVersionInfo(versionInfo) {
         dispatch({ type: ACTION_VERSION_INFO, versionInfo })
       },
+      onStaticIndicator(status: boolean) {
+        dispatch({ type: ACTION_STATIC_INDICATOR, staticIndicator: status })
+      },
+      onDebugInfo(debugInfo) {
+        dispatch({ type: ACTION_DEBUG_INFO, debugInfo })
+      },
     }
   }, [dispatch])
+
+  //  We render a separate error overlay at the root when an error is thrown from rendering RSC, so
+  //  we should not render an additional error overlay in the descendent. However, we need to
+  //  keep rendering these hooks to ensure HMR works when the error is addressed.
+  const shouldRenderErrorOverlay = useSyncExternalStore(
+    () => () => {},
+    () => !shouldRenderRootLevelErrorOverlay(),
+    () => true
+  )
 
   const handleOnUnhandledError = useCallback(
     (error: Error): void => {
       const errorDetails = (error as any).details as
         | HydrationErrorState
         | undefined
-      // Component stack is added to the error in use-error-handler in case there was a hydration errror
+      // Component stack is added to the error in use-error-handler in case there was a hydration error
       const componentStackTrace =
         (error as any)._componentStack || errorDetails?.componentStack
       const warning = errorDetails?.warning
+      const stitchedError = getReactStitchedError(error)
+
       dispatch({
         type: ACTION_UNHANDLED_ERROR,
-        reason: error,
-        frames: parseStack(error.stack!),
+        reason: stitchedError,
+        frames: parseStack(stitchedError.stack || ''),
         componentStackFrames:
           typeof componentStackTrace === 'string'
             ? parseComponentStack(componentStackTrace)
@@ -525,19 +622,18 @@ export default function HotReload({
     },
     [dispatch]
   )
+
   const handleOnUnhandledRejection = useCallback(
     (reason: Error): void => {
+      const stitchedError = getReactStitchedError(reason)
       dispatch({
         type: ACTION_UNHANDLED_REJECTION,
-        reason: reason,
-        frames: parseStack(reason.stack!),
+        reason: stitchedError,
+        frames: parseStack(stitchedError.stack || ''),
       })
     },
     [dispatch]
   )
-  const handleOnReactError = useCallback(() => {
-    RuntimeErrorHandler.hadRuntimeError = true
-  }, [])
   useErrorHandler(handleOnUnhandledError, handleOnUnhandledRejection)
 
   const webSocketRef = useWebsocket(assetPrefix)
@@ -548,29 +644,63 @@ export default function HotReload({
   )
 
   const router = useRouter()
-  const pathname = usePathname()
+
+  // We don't want access of the pathname for the dev tools to trigger a dynamic
+  // access (as the dev overlay will never be present in production).
+  const pathname = useUntrackedPathname()
   const appIsrManifestRef = useRef<Record<string, false | number>>({})
   const pathnameRef = useRef(pathname)
 
-  if (process.env.__NEXT_APP_ISR_INDICATOR) {
+  if (
+    process.env.__NEXT_APP_ISR_INDICATOR ||
+    process.env.__NEXT_EXPERIMENTAL_NEW_DEV_OVERLAY
+  ) {
     // this conditional is only for dead-code elimination which
     // isn't a runtime conditional only build-time so ignore hooks rule
     // eslint-disable-next-line react-hooks/rules-of-hooks
     useEffect(() => {
       pathnameRef.current = pathname
-      const isrIndicatorHandlers: ShowHideHandler | undefined =
-        window.next?.isrIndicatorHandlers
 
       const appIsrManifest = appIsrManifestRef.current
 
-      if (isrIndicatorHandlers && appIsrManifest) {
-        if (pathname in appIsrManifest) {
-          isrIndicatorHandlers.show()
+      if (appIsrManifest) {
+        if (pathname && pathname in appIsrManifest) {
+          try {
+            if (process.env.__NEXT_APP_ISR_INDICATOR) {
+              const indicatorHiddenAt = Number(
+                localStorage?.getItem('__NEXT_DISMISS_PRERENDER_INDICATOR')
+              )
+
+              const isHidden =
+                indicatorHiddenAt &&
+                !isNaN(indicatorHiddenAt) &&
+                Date.now() < indicatorHiddenAt
+
+              if (!isHidden) {
+                dispatcher.onStaticIndicator(true)
+              }
+            } else if (process.env.__NEXT_EXPERIMENTAL_NEW_DEV_OVERLAY) {
+              dispatcher.onStaticIndicator(true)
+            }
+          } catch (reason) {
+            let message = ''
+
+            if (reason instanceof DOMException) {
+              // Most likely a SecurityError, because of an unavailable localStorage
+              message = reason.stack ?? reason.message
+            } else if (reason instanceof Error) {
+              message = 'Error: ' + reason.message + '\n' + (reason.stack ?? '')
+            } else {
+              message = 'Unexpected Exception: ' + reason
+            }
+
+            console.warn('[HMR] ' + message)
+          }
         } else {
-          isrIndicatorHandlers.hide()
+          dispatcher.onStaticIndicator(false)
         }
       }
-    }, [pathname])
+    }, [pathname, dispatcher])
   }
 
   useEffect(() => {
@@ -580,6 +710,7 @@ export default function HotReload({
     const handler = (event: MessageEvent<any>) => {
       try {
         const obj = JSON.parse(event.data)
+        handleDevBuildIndicatorHmrEvents(obj)
         processMessage(
           obj,
           sendMessage,
@@ -591,7 +722,10 @@ export default function HotReload({
         )
       } catch (err: any) {
         console.warn(
-          '[HMR] Invalid message: ' + event.data + '\n' + (err?.stack ?? '')
+          '[HMR] Invalid message: ' +
+            JSON.stringify(event.data) +
+            '\n' +
+            (err?.stack ?? '')
         )
       }
     }
@@ -607,9 +741,17 @@ export default function HotReload({
     appIsrManifestRef,
   ])
 
-  return (
-    <ReactDevOverlay onReactError={handleOnReactError} state={state}>
-      {children}
-    </ReactDevOverlay>
-  )
+  if (shouldRenderErrorOverlay) {
+    return (
+      <ReactDevOverlay
+        state={state}
+        dispatcher={dispatcher}
+        globalError={globalError}
+      >
+        {children}
+      </ReactDevOverlay>
+    )
+  }
+
+  return children
 }
